@@ -1,6 +1,6 @@
 # GWSens
 
-[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://streamlit.io/)
+[![Streamlit App](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://app-gwsens.streamlit.app/)
 
 Interactive gravitational wave sensitivity curve plotter.
 
@@ -28,3 +28,4 @@ Add custom detectors/sources by placing CSV files in `data/detectors/` or `data/
 ## References
 
 Inspired by [gwplotter.com](http://gwplotter.com/)
+
