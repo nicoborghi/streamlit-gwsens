@@ -1,452 +1,330 @@
+"""GWSens - Gravitational Wave Sensitivity Curve Visualizer"""
+
+import io
+from pathlib import Path
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
-from matplotlib.patches import Polygon
 import matplotlib.patheffects as PathEffects
-import streamlit as st
+from matplotlib.patches import Polygon
+from matplotlib.ticker import FuncFormatter
 import numpy as np
-import json
+import streamlit as st
 
-dir_detectors   = "data/detectors/"
-dir_sources     = "data/sources/"
-label_linewidth = 2
-label_color     = "#ffffff"
+from config import (
+    DATA_DIR_DETECTORS, DATA_DIR_SOURCES, AXIS_DEFAULTS, THEME_SETTINGS,
+    DETECTORS, SOURCES, get_default_detectors, get_default_sources,
+    get_detector_references, get_source_references,
+)
 
-def hex_to_rgb(value):
-    value = value.lstrip('#')
-    lv = len(value)
-    return tuple(int(value[i:i + lv // 3], 16) for i in range(0, lv, lv // 3))
+# =============================================================================
+# PAGE CONFIG & CONSTANTS
+# =============================================================================
+st.set_page_config(page_title="GWSens", page_icon=":dizzy:", layout="wide")
+PLOT_TYPES = {1: "Characteristic Strain", 0: "Power Spectral Density"}
 
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
 
-def gradient_fill(x, y, fill_color=None, ymin=0, ax=None, **kwargs):
-    """
-    Plot a line with a linear alpha gradient filled beneath it.
-
-    Parameters
-    ----------
-    x, y : array-like
-        The data values of the line.
-    fill_color : a matplotlib color specifier (string, tuple) or None
-        The color for the fill. If None, the color of the line will be used.
-    ax : a matplotlib Axes instance
-        The axes to plot on. If None, the current pyplot axes will be used.
-    Additional arguments are passed on to matplotlib's ``plot`` function.
-
-    Returns
-    -------
-    line : a Line2D instance
-        The line plotted.
-    im : an AxesImage instance
-        The transparent gradient clipped to just the area beneath the curve.
-
-    FROM: https://stackoverflow.com/questions/29321835/is-it-possible-to-get-color-gradients-under-curve-in-matplotlib
-    """
-    if ax is None:
-        ax = plt.gca()
-
-    alpha= .8
+def gradient_fill(x, y, fill_color, ymin, ax, alpha=0.8):
+    """Plot gradient-filled area beneath a curve."""
     z = np.empty((100, 1, 4), dtype=float)
-
-    rgb = mcolors.to_rgb(fill_color)
-    z[:,:,:3] = rgb
-    z[:,:,-1] = np.linspace(0, alpha, 100)[:,None]
-
-    # xmin, xmax, ymin, ymax = x.min(), x.max(), y.min(), y.max()
-    xmin, xmax, ymin, ymax = x.min(), x.max(), ymin, y.max()
-
-
-    im = ax.imshow(z, aspect='auto', extent=[xmin, xmax, ymin, ymax],
-                   origin='lower')
-
-    xy = np.column_stack([x, y])
-    xy = np.vstack([[xmin, ymin], xy, [xmax, ymin], [xmin, ymin]])
-    clip_path = Polygon(xy, facecolor='none', edgecolor='none', closed=True)
+    z[:, :, :3] = mcolors.to_rgb(fill_color)
+    z[:, :, -1] = np.linspace(0, alpha, 100)[:, None]
+    im = ax.imshow(z, aspect="auto", extent=[x.min(), x.max(), ymin, y.max()], origin="lower")
+    xy = np.vstack([[x.min(), ymin], np.column_stack([x, y]), [x.max(), ymin], [x.min(), ymin]])
+    clip_path = Polygon(xy, facecolor="none", edgecolor="none", closed=True)
     ax.add_patch(clip_path)
     im.set_clip_path(clip_path)
-
     ax.autoscale(True)
     return im
 
+def data_to_plot(data, plot_type):
+    """Transform data for plotting (returns log10 values)."""
+    x = np.log10(data[:, 0])
+    if plot_type == 1:
+        return x, np.log10(data[:, 1])
+    H0 = 3.240779291010696e-18
+    return x, np.log10(2 * (np.pi * data[:, 1] * data[:, 0] / H0) ** 2)
 
+def save_figure(fig, fmt, facecolor):
+    """Save figure to bytes buffer."""
+    buf = io.BytesIO()
+    fig.savefig(buf, format=fmt, facecolor=facecolor, edgecolor='none', bbox_inches="tight")
+    buf.seek(0)
+    return buf.getvalue()
 
-def data2plot(data, plottype):
-    if plottype == 1:
-        x = np.log10(data[:,0])
-        y = np.log10(data[:,1])
+def format_label(label, use_latex, use_bold):
+    """Format label for display, optionally bold."""
+    if use_latex:
+        # Escape special LaTeX characters
+        label = label.replace("_", r"\_")
+        lines = label.split("\n")
+        if use_bold:
+            return "\n".join(rf"\textbf{{{line}}}" for line in lines)
+        return "\n".join(lines)
+    return label
 
-    elif plottype == 0:
-        H0 = 3.240779291010696e-18
-        x = np.log10(data[:,0])
-        y = np.log10(2*(np.pi*data[:,1]*x/H0)**2)
-    return x, y 
+@st.cache_data
+def load_detector_data(key):
+    return np.loadtxt(Path(DATA_DIR_DETECTORS) / DETECTORS[key]["file"], delimiter=",", skiprows=1)
 
+@st.cache_data
+def load_source_data(key):
+    return np.loadtxt(Path(DATA_DIR_SOURCES) / SOURCES[key]["file"], delimiter=",", skiprows=1)
 
-# function toEnergySpec(data) {
-# 	var H0 = 3.240779291010696e-18;
-# 	return data.map(function(val) {
-# 		var f = val[0];
-# 		var hc = val[1];
-# 		return [f, 2*Math.pow(Math.PI*f*hc/H0,2)];
-# 	});
-# }
+# =============================================================================
+# SESSION STATE
+# =============================================================================
+if "detector_overrides" not in st.session_state:
+    st.session_state.detector_overrides = {}
+if "source_overrides" not in st.session_state:
+    st.session_state.source_overrides = {}
+if "last_theme" not in st.session_state:
+    st.session_state.last_theme = "Light"
 
+def get_override(cat, key, field, default):
+    return st.session_state.get(f"{cat}_overrides", {}).get(key, {}).get(field, default)
 
+def set_override(cat, key, field, value):
+    st.session_state.setdefault(f"{cat}_overrides", {}).setdefault(key, {})[field] = value
 
-st.set_page_config(page_title="GW Plotter", page_icon=":dizzy:", layout="wide")
-st.title("GW Plotter 1.1 beta")
+# =============================================================================
+# SIDEBAR
+# =============================================================================
+st.sidebar.title("GWSens")
+st.sidebar.caption("Gravitational Wave Sensitivity Curve Plotter")
 
-@st.cache(allow_output_mutation=True, suppress_st_warning=True)
-def load_DET():
-    def_curve_col = "#000000"
+# Plot type
+plot_type = st.sidebar.radio("Plot type:", list(PLOT_TYPES.keys()), format_func=lambda x: PLOT_TYPES[x])
 
-    NDET         = 19
-    dict_DET     = [[]]*NDET
-    dict_DET[0]  = {'todo':0,'color':def_curve_col,'label':'EPTA','label_x':2e-6,'label_y':5e-13  , 'N_pulsars':5,  'ObsTime':10,'ObsRate':14,'TimingPrec':1e-7}
-    dict_DET[1]  = {'todo':1,'color':def_curve_col,'label':'IPTA','label_x':2e-6,'label_y':1e-13  , 'N_pulsars':20, 'ObsTime':15,'ObsRate':14,'TimingPrec':1e-7}
-    dict_DET[2]  = {'todo':0,'color':def_curve_col,'label':'SKA' ,'label_x':2e-6,'label_y':7.5e-15, 'N_pulsars':100,'ObsTime':20,'ObsRate':14,'TimingPrec':3e-8}
+# Selections
+det_labels = {k: DETECTORS[k]["label"] for k in DETECTORS}
+selected_det = st.sidebar.multiselect("Sensitivity curves", list(DETECTORS.keys()),
+                                       default=get_default_detectors(), format_func=lambda x: det_labels[x])
+selected_src = st.sidebar.multiselect("Sources", list(SOURCES.keys()), default=get_default_sources())
 
-    dict_DET[3]  = {'todo':0,'color':def_curve_col,'label':'eLISA'   ,'label_x':1.5e-6,'label_y':7e-17}
-    dict_DET[4]  = {'todo':1,'color':def_curve_col,'label':'LISA'    ,'label_x':2e-6  ,'label_y':1e-18}
-    dict_DET[5]  = {'todo':0,'color':def_curve_col,'label':'DECIGO'  ,'label_x':7e-2  ,'label_y':1e-23}
-    dict_DET[6]  = {'todo':0,'color':def_curve_col,'label':'BBO'     ,'label_x':4.2e-3,'label_y':2e-24}
-    dict_DET[7]  = {'todo':0,'color':def_curve_col,'label':'ALIA'    ,'label_x':1e-1  ,'label_y':7e-22}
-    dict_DET[8]  = {'todo':0,'color':def_curve_col,'label':'TianQin' ,'label_x':2.5e+0,'label_y':1.5e-18}
+# Theme
+theme = st.sidebar.selectbox("Theme", list(THEME_SETTINGS.keys()))
+theme_cfg = THEME_SETTINGS[theme]
 
-    dict_DET[9]  = {'todo':0,'color':def_curve_col,'label':'GEO'           ,'label_x':5e+4  ,'label_y':1.55e-18}
-    dict_DET[10] = {'todo':0,'color':def_curve_col,'label':'LIGO'          ,'label_x':5e+4  ,'label_y':7.99e-19}
-    dict_DET[11] = {'todo':0,'color':def_curve_col,'label':'aLIGO-O1'      ,'label_x':5e+4  ,'label_y':1.1e-19}
-    dict_DET[12] = {'todo':1,'color':def_curve_col,'label':'aLIGOD'        ,'label_x':5e+4  ,'label_y':5.68e-20}
-    dict_DET[13] = {'todo':0,'color':def_curve_col,'label':'ApLIGO'        ,'label_x':5e+4  ,'label_y':1.51e-20}
-    dict_DET[14] = {'todo':0,'color':def_curve_col,'label':'Virgo'         ,'label_x':5e+4  ,'label_y':4.12e-19}
-    dict_DET[15] = {'todo':0,'color':def_curve_col,'label':'aVirgo'        ,'label_x':5e+4  ,'label_y':2.13e-19}
-    dict_DET[16] = {'todo':0,'color':def_curve_col,'label':'KAGRA'         ,'label_x':5e+4  ,'label_y':2.92e-20}
-    dict_DET[17] = {'todo':0,'color':def_curve_col,'label':'ET'            ,'label_x':5e+4  ,'label_y':7.55e-21}
-    dict_DET[18] = {'todo':0,'color':def_curve_col,'label':'CE'            ,'label_x':5e+4  ,'label_y':3.9e-21}
+# Reset color overrides when theme changes
+if theme != st.session_state.last_theme:
+    for key in st.session_state.detector_overrides:
+        st.session_state.detector_overrides[key].pop("color", None)
+    st.session_state.last_theme = theme
 
-    # Load sensitivity data
-    for i in range(NDET):
-        with open(dir_detectors+dict_DET[i]["label"]+'.json', "r") as read_file:
-            data = json.load(read_file)
-            dict_DET[i]["data"] = data["data"]
+# LaTeX and bold
+c1, c2 = st.sidebar.columns(2)
+use_latex = c1.checkbox("LaTeX", value=False, help="Requires LaTeX installation")
+use_bold = c2.checkbox("Bold labels", value=False)
+plt.style.use(theme_cfg["style"])
+matplotlib.rcParams["text.usetex"] = use_latex
+if use_latex:
+    matplotlib.rcParams["font.family"] = "serif"
+    matplotlib.rcParams["font.serif"] = ["Computer Modern Roman"]
+else:
+    matplotlib.rcParams["font.family"] = "sans-serif"
 
-    return dict_DET
+# Figure size
+st.sidebar.write("**Figure Size**")
+c1, c2 = st.sidebar.columns(2)
+fig_width = c1.number_input("Width", 4.0, 20.0, 7.0, step=0.5)
+fig_height = c2.number_input("Height", 3.0, 15.0, 4.5, step=0.5)
+fig_dpi = st.sidebar.number_input("DPI", 72, 600, 300, step=50)
 
+# Axis limits
+st.sidebar.write("**Axis Limits**")
+c1, c2 = st.sidebar.columns(2)
+x_min = c1.number_input("$x_{min}$", format="%.1e", value=AXIS_DEFAULTS["x_min"])
+y_min = c1.number_input("$y_{min}$", format="%.1e", value=AXIS_DEFAULTS["y_min"])
+x_max = c2.number_input("$x_{max}$", format="%.1e", value=AXIS_DEFAULTS["x_max"])
+y_max = c2.number_input("$y_{max}$", format="%.1e", value=AXIS_DEFAULTS["y_max"])
 
+# Styling
+st.sidebar.write("**Styling**")
+c1, c2 = st.sidebar.columns(2)
+line_width = c1.slider("Line width", 0.5, 5.0, 1.5, 0.5)
+label_fontsize = c1.slider("Label font", 6, 16, 8)
+axis_fontsize = c2.slider("Axis font", 8, 18, 10)
+label_stroke = c2.slider("Label stroke", 0, 5, theme_cfg["label_linewidth"])
+c1, c2 = st.sidebar.columns(2)
+label_color = c1.color_picker("Stroke color", theme_cfg["label_color"])
+grid_color = c2.color_picker("Grid color", "#808080" if theme == "Light" else "#404040")
 
-@st.cache(allow_output_mutation=True, suppress_st_warning=True)
-def load_SOURCES():
-
-    NSOURCES        = 11
-    dict_SOURCES    = [[]]*NSOURCES
-    dict_SOURCES[0] = {'todo':1,'color':'#cc6600','label':'Stochastic\nbackground'         ,'label_x':7.6e-11 ,'label_y':3.7e-14}
-    dict_SOURCES[1] = {'todo':0,'color':'#e69900','label':'Supermassive\nbinaries'         ,'label_x':3.5e-7  ,'label_y':1e-17}
-    dict_SOURCES[2] = {'todo':0,'color':'#59b2e6','label':'Resolvable\ngalactic binaries'  ,'label_x':2.5e-3  ,'label_y':1.5e-18}
-    dict_SOURCES[3] = {'todo':0,'color':'#00ff00','label':'Unresolvable\ngalactic binaries','label_x':5e-7    ,'label_y':1e-21}
-    dict_SOURCES[4] = {'todo':1,'color':'#0073b2','label':'Massive\nbinaries'              ,'label_x':1e-4    ,'label_y':2e-17}
-    dict_SOURCES[5] = {'todo':1,'color':'#009980','label':'Extreme mass\nratio inspirals'  ,'label_x':9e-7    ,'label_y':2e-20}
-    dict_SOURCES[6] = {'todo':1,'color':'#a0a1c8','label':'Type IA\nsupernovae'           ,'label_x':3.3e-1  ,'label_y':2e-20}
-    dict_SOURCES[7] = {'todo':1,'color':'#cc99b2','label':'Compact binary\ninspirals'      ,'label_x':3e+3    ,'label_y':3e-23}
-    dict_SOURCES[8] = {'todo':0,'color':'#800080','label':'Core collapse\nsupernovae'      ,'label_x':3e+3    ,'label_y':4e-24, 'Dist':0.3}
-    dict_SOURCES[9] = {'todo':0,'color':'#ffffff','label':'Pulsars'                        ,'label_x':8e+4    ,'label_y':5e-25, 'AmplScale':1}
-    dict_SOURCES[10]= {'todo':1,'color':'#ff0000','label':'GW150914'                       ,'label_x':3e+1    ,'label_y':7e-21}
-
-    alias_names    = ["BKG", "SMBBH", "GalBinRes", "GalBinUnres",
-                    "MBBH", "EMRI", "SNIa", "CBC", "CCSN", "PSR", "GW150914" ]
-
-    for i in range(NSOURCES):
-        with open(dir_sources+alias_names[i]+'.json', "r") as read_file:
-            data = json.load(read_file)
-            dict_SOURCES[i]["data"] = data["data"]
-
-    return dict_SOURCES, alias_names
-
-
-def ff_alias_SOURCES(name):
-    ind = all_SOURCES.index(name)
-    return alias_SOURCES[ind]
-
-
-
-st.sidebar.header("🪄 Settings")
-
-# Select plot type
-plottypes = ["Characteristic Strain", "Power Spectral Density"]
-def headerlabel(number):
-    return "{1}".format(number, plottypes[number-1])
-plottype = st.sidebar.radio('Select plot type:', [1,0], format_func=headerlabel)
-
-# Load (only for the first time) the baseline settings
-dict_DET  = load_DET()
-NDET      = len(dict_DET)
-all_DET   = [dict_DET[i]["label"] for i in range(NDET)]
-todo_DET  = [dict_DET[i]['label'] for i in range(NDET) if dict_DET[i]['todo']==1]
-
-dict_SOURCES, alias_SOURCES = load_SOURCES()
-NSOURCES                    = len(dict_SOURCES)
-all_SOURCES                 = [dict_SOURCES[i]["label"] for i in range(NSOURCES)]
-todo_SOURCES                = [dict_SOURCES[i]['label'] for i in range(NSOURCES) if dict_SOURCES[i]['todo']==1]
-
-
-# Multiselect entries
-todo_DET         = st.sidebar.multiselect('Detectors', all_DET , default=todo_DET)
-todo_SOURCES     = st.sidebar.multiselect('Sources', all_SOURCES, default=todo_SOURCES, format_func=ff_alias_SOURCES)
-ind_todo_DET     = [all_DET.index(i) for i in todo_DET]
-ind_todo_SOURCES = [all_SOURCES.index(i) for i in todo_SOURCES]
-
-
-# Plot Settings
-todo_theme = st.sidebar.selectbox("Theme", ["Light", "Dark"])
-if todo_theme == "Dark":
-    plt.style.use("dark_background")
-    label_linewidth = 0
-    for i in range(NDET):
-        dict_DET[i]['color'] = "#ffffff"      
-
-if todo_theme == "Light":
-    label_linewidth = 2
-    label_color     = "#ffffff"
-    plt.style.use("default")
-    for i in range(NDET):
-        dict_DET[i]['color'] = "#000000"  
-
-st.sidebar.write("Elements")
-
-xlims = np.array([0.4e-10, 1.4e+6])
-ylims = np.array([1e-26, 1.1e-12])
-col1, col2= st.sidebar.columns(2)
-
-with col1:
-    xlims[0] = st.number_input(label="$x_{min}$", format="%.1e", value=xlims[0], step=xlims[0]/10)
-    ylims[0] = st.number_input(label="$y_{min}$", format="%.1e", value=ylims[0], step=ylims[0]/10)
-with col2:
-    xlims[1] = st.number_input(label="$x_{max}$", format="%.1e", value=xlims[1], step=xlims[1]/10)
-    ylims[1] = st.number_input(label="$y_{max}$", format="%.1e", value=ylims[1], step=ylims[1]/10)
-
-col1, col2 = st.sidebar.columns(2)
-with col1:
-    label_linewidth = col1.number_input("Label contur width", 0, 10, label_linewidth)
-with col2:
-    label_color = col2.color_picker("Label color", label_color) 
-
-
-
-
-
-
-
-        
-
+# Plot credit/watermark
+plot_credit = st.sidebar.text_input("Plot credit", value="streamlit/GWSens and references therein")
 
 # Advanced settings
-st.sidebar.subheader("Advanced settings")
-todo_type  = st.sidebar.selectbox(" ", ["Detector", "Source"])
-# st.markdown(
-#     """
-#     <style>
-#     [data-baseweb="select"] {
-#         margin-top: -40px;
-#     }
-#     </style>
-#     """,
-#     unsafe_allow_html=True,
-# )
-if todo_type == "Detector":
-    adv_DET    = st.sidebar.selectbox("Type", all_DET)
-    ind        = all_DET.index(adv_DET)
-    col1, col2 = st.sidebar.columns(2)
+st.sidebar.subheader("Advanced Settings")
+adv_type = st.sidebar.selectbox("Edit", ["Sensitivity curve", "Source"])
 
-    with col1:
-        dict_DET[ind]['label_x'] = st.number_input(label="$x_{label}$", format="%.1e", 
-                                                value=dict_DET[ind]['label_x'], 
-                                                step=dict_DET[ind]['label_x']/2)
-        dict_DET[ind]['label']   = st.text_input('Label',dict_DET[ind]['label'])
-    with col2:
-        dict_DET[ind]['label_y'] = st.number_input(label="$y_{label}$", format="%.1e", 
-                                                value=dict_DET[ind]['label_y'], 
-                                                step=dict_DET[ind]['label_y']/2)
-        dict_DET[ind]['color']   = st.color_picker("Color", value=dict_DET[ind]['color'])
+if adv_type == "Sensitivity curve" and selected_det:
+    adv_key = st.sidebar.selectbox("Select curve", selected_det, format_func=lambda x: det_labels[x])
+    det = DETECTORS[adv_key]
+    c1, c2 = st.sidebar.columns(2)
 
-elif todo_type == "Source":
-    adv_SOURCE = st.sidebar.selectbox("Type", all_SOURCES)
-    ind        = all_SOURCES.index(adv_SOURCE)
-    col1, col2 = st.sidebar.columns(2)
+    new_x = c1.number_input("$x_{label}$", format="%.1e",
+                            value=get_override("detector", adv_key, "label_x", det["label_x"]), key=f"dx_{adv_key}")
+    set_override("detector", adv_key, "label_x", new_x)
 
-    with col1:
-        dict_SOURCES[ind]['label_x'] = st.number_input(label="$x_{label}$", format="%.1e", 
-                                                value=dict_SOURCES[ind]['label_x'], 
-                                                step=dict_SOURCES[ind]['label_x']/2)
-        dict_SOURCES[ind]['label']   = st.text_input('Label',dict_SOURCES[ind]['label'])
-    with col2:
-        dict_SOURCES[ind]['label_y'] = st.number_input(label="$y_{label}$", format="%.1e", 
-                                                value=dict_SOURCES[ind]['label_y'], 
-                                                step=dict_SOURCES[ind]['label_y']/2)
-        dict_SOURCES[ind]['color']   = st.color_picker("Color", value=dict_SOURCES[ind]['color'])
+    variants = det.get("variants", [])
+    if variants:
+        opts = [det["label"]] + variants
+        cur = get_override("detector", adv_key, "label", det["label"])
+        if cur not in opts: opts.append(cur)
+        new_label = c1.selectbox("Label", opts, index=opts.index(cur) if cur in opts else 0, key=f"dl_{adv_key}")
+    else:
+        new_label = c1.text_input("Label", get_override("detector", adv_key, "label", det["label"]), key=f"dl_{adv_key}")
+    set_override("detector", adv_key, "label", new_label)
 
+    new_y = c2.number_input("$y_{label}$", format="%.1e",
+                            value=get_override("detector", adv_key, "label_y", det["label_y"]), key=f"dy_{adv_key}")
+    set_override("detector", adv_key, "label_y", new_y)
 
+    new_color = c2.color_picker("Color", get_override("detector", adv_key, "color", theme_cfg["detector_color"]), key=f"dc_{adv_key}")
+    set_override("detector", adv_key, "color", new_color)
 
+elif adv_type == "Source" and selected_src:
+    adv_key = st.sidebar.selectbox("Select source", selected_src)
+    src = SOURCES[adv_key]
+    c1, c2 = st.sidebar.columns(2)
 
+    new_x = c1.number_input("$x_{label}$", format="%.1e",
+                            value=get_override("source", adv_key, "label_x", src["label_x"]), key=f"sx_{adv_key}")
+    set_override("source", adv_key, "label_x", new_x)
 
+    new_label = c1.text_input("Label", get_override("source", adv_key, "label", src["label"]), key=f"sl_{adv_key}")
+    set_override("source", adv_key, "label", new_label)
 
+    new_y = c2.number_input("$y_{label}$", format="%.1e",
+                            value=get_override("source", adv_key, "label_y", src["label_y"]), key=f"sy_{adv_key}")
+    set_override("source", adv_key, "label_y", new_y)
 
-if st.sidebar.button('Reset'):
-    st.runtime.legacy_caching.clear_cache()
-    st.runtime.legacy_caching.clear_cache()
+    new_color = c2.color_picker("Color", get_override("source", adv_key, "color", src["color"]), key=f"sc_{adv_key}")
+    set_override("source", adv_key, "color", new_color)
 
+if st.sidebar.button("Reset All"):
+    st.session_state.detector_overrides = {}
+    st.session_state.source_overrides = {}
+    st.cache_data.clear()
+    st.rerun()
 
+# =============================================================================
+# MAIN CONTENT
+# =============================================================================
 
+# Determine colors
+fig_bg = "white" if theme == "Light" else "#0e1117"
 
+# Create figure
+fig, ax = plt.subplots(figsize=(fig_width, fig_height), dpi=fig_dpi, facecolor=fig_bg)
+ax.set_facecolor(fig_bg)
 
-#################################################### PLOTTING
+# Plot sensitivity curves
+for key in selected_det:
+    det = DETECTORS[key]
+    x, y = data_to_plot(load_detector_data(key), plot_type)
+    color = get_override("detector", key, "color", theme_cfg["detector_color"])
+    label = get_override("detector", key, "label", det["label"])
+    lx = get_override("detector", key, "label_x", det["label_x"])
+    ly = get_override("detector", key, "label_y", det["label_y"])
 
-fig, ax = plt.subplots(figsize=(9,5),dpi=300)
-for ind in ind_todo_DET:
-    # Plot Detectors
-    tdet    = dict_DET[ind]
-    x, y = data2plot(np.array(tdet["data"]), plottype)
+    ax.plot(x, y, color=color, linewidth=line_width)
+    display_label = format_label(label, use_latex, use_bold)
+    fontweight = "bold" if use_bold else "normal"
+    txt = ax.text(np.log10(lx), np.log10(ly), display_label, fontsize=label_fontsize, fontweight=fontweight, color=color)
+    txt.set_path_effects([PathEffects.withStroke(linewidth=label_stroke, foreground=label_color)])
 
-    ax.plot(x, y, color=tdet["color"])
-    txt = ax.text(s=tdet["label"], x=np.log10(tdet["label_x"]), y=np.log10(tdet["label_y"]), 
-                  fontsize=8, fontweight='bold', color=tdet["color"])
-    txt.set_path_effects([PathEffects.withStroke(linewidth=label_linewidth, foreground=label_color)])
+# Plot sources
+for key in selected_src:
+    src = SOURCES[key]
+    x, y = data_to_plot(load_source_data(key), plot_type)
+    color = get_override("source", key, "color", src["color"])
+    label = get_override("source", key, "label", src["label"])
+    lx = get_override("source", key, "label_x", src["label_x"])
+    ly = get_override("source", key, "label_y", src["label_y"])
 
-for ind in ind_todo_SOURCES:
-    # Plot Sources
-    tsource = dict_SOURCES[ind]
-    x, y = data2plot(np.array(tsource["data"]), plottype)
+    gradient_fill(x, y, color, np.log10(y_min), ax)
+    display_label = format_label(label, use_latex, use_bold)
+    fontweight = "bold" if use_bold else "normal"
+    txt = ax.text(np.log10(lx), np.log10(ly), display_label, fontsize=label_fontsize, fontweight=fontweight, ha="left", color=color)
+    txt.set_path_effects([PathEffects.withStroke(linewidth=label_stroke, foreground=label_color)])
 
-    gradient_fill(x,y,fill_color=tsource["color"],c=tsource["color"],ymin=np.log10(ylims[0]),ax=ax)
-    txt = ax.text(s=tsource["label"], x=np.log10(tsource["label_x"]), y=np.log10(tsource["label_y"]),
-                  fontsize=8, ha="left", fontweight='bold',color=tsource["color"])
+# Configure axes
+ax.grid(True, which="both", ls="dotted", linewidth=0.8, alpha=0.8, color=grid_color, zorder=0)
+ax.set_xlabel("Frequency (Hz)", fontsize=axis_fontsize)
+ax.set_ylabel(PLOT_TYPES[plot_type], fontsize=axis_fontsize)
+ax.set_xlim(np.log10(x_min), np.log10(x_max))
+ax.set_ylim(np.log10(y_min), np.log10(y_max))
+ax.tick_params(labelsize=axis_fontsize - 2)
 
-    txt.set_path_effects([PathEffects.withStroke(linewidth=label_linewidth, foreground=label_color)])
+def power_of_10_formatter(x, pos):
+    """Format tick as 10^x without mathtext issues."""
+    exp = int(x)
+    return f"$10^{{{exp}}}$"
 
-ax.grid(True, which='both', ls='dotted', linewidth='0.8', alpha=.8, zorder=0)
-ax.set_xlabel("Frequency (Hz)")
-ax.set_ylabel("Characteristic Strain")
-ax.set_xlim(*np.log10(xlims))
-ax.set_ylim(*np.log10(ylims))
+ax.xaxis.set_major_formatter(FuncFormatter(power_of_10_formatter))
+ax.yaxis.set_major_formatter(FuncFormatter(power_of_10_formatter))
 
-ax.xaxis.set_major_formatter('10$^{{{x:.0f}}}$')
-ax.yaxis.set_major_formatter('10$^{{{x:.0f}}}$')
-# ax.set_xscale('log')
-# ax.set_yscale('log')
+# Add plot credit aligned with axis right edge
+if plot_credit:
+    credit_color = "#666666" if theme == "Light" else "#aaaaaa"
+    ax.text(1.0, -0.08, plot_credit, ha='right', va='top', fontsize=8,
+            color=credit_color, transform=ax.transAxes)
 
+try:
+    plt.tight_layout()
+except ValueError:
+    pass  # Skip tight_layout if it fails - not critical
 
-fn = "gwplotter.png"
-plt.tight_layout()
-plt.savefig(fn, transparent=True)
-with open(fn, "rb") as img:
-    btn = st.download_button(
-        label="Download image",
-        data=img,
-        file_name=fn,
-        mime="image/png"
-    )
-st.pyplot(fig)
+# Display plot - wrap in try/except for robustness
+try:
+    st.pyplot(fig, use_container_width=True)
+except ValueError:
+    # Fallback: save to buffer and display as image
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', facecolor=fig_bg, dpi=150)
+    buf.seek(0)
+    st.image(buf, use_container_width=True)
 
-st.write("")
+# Download buttons (below figure)
+st.write("**Download:**")
+c1, c2, c3, c4 = st.columns(4)
+try:
+    c1.download_button("PNG", save_figure(fig, "png", fig_bg), "gwsens.png", "image/png")
+    c2.download_button("PDF", save_figure(fig, "pdf", fig_bg), "gwsens.pdf", "application/pdf")
+    c3.download_button("SVG", save_figure(fig, "svg", fig_bg), "gwsens.svg", "image/svg+xml")
+    c4.download_button("JPEG", save_figure(fig, "jpeg", "white"), "gwsens.jpg", "image/jpeg")
+except ValueError:
+    st.caption("Downloads temporarily unavailable - adjust a setting to refresh")
 
+plt.close(fig)
 
-########################################## REFS
-st.write("")
+# =============================================================================
+# REFERENCES
+# =============================================================================
+st.divider()
 st.subheader("References")
-st.markdown("[http://gwplotter.com/](http://gwplotter.com/)")
-st.write("TBD")
 
+det_refs = get_detector_references(selected_det)
+src_refs = get_source_references(selected_src)
 
+if det_refs or src_refs:
+    if det_refs:
+        st.write("**Sensitivity curves:**")
+        for r in det_refs:
+            link = f" — [link]({r['url']})" if r["url"] else ""
+            st.markdown(f"- **{r['name']}**: {r['reference']}{link}")
+    if src_refs:
+        st.write("**Sources:**")
+        for r in src_refs:
+            link = f" — [link]({r['url']})" if r["url"] else ""
+            st.markdown(f"- **{r['name']}**: {r['reference']}{link}")
+else:
+    st.info("Select sensitivity curves or sources to see their references.")
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-########################################################################################## JUNK
-
-# st.write(dict_DET[ind]['label'])
-
-#     # for i in range(NDET):
-    #     st.write(dict_DET[i]["label"])
-
-
-# d = [dict_PT, dict_SPACE, dict_GROUND]
-# d = [*dict_PT, *dict_SPACE , *dict_GROUND]
-# t = [todo_PT, todo_SPACE, todo_GROUND]
-# n = ["*Pulsar Timing*", "Space-based", "Ground-based"]
-
-
-
-
-# cols = st.columns(len(d[k]))
-# for i, c in enumerate(cols):
-#     with c:
-#         t[k][i] = st.checkbox(d[k][i]['label'])
-
-
-# for k in range(3):
-#     st.write(n[k])
-#     cols = st.columns(len(d[k]))
-#     for i, c in enumerate(cols):
-#         with c:
-#             t[k][i] = st.checkbox(d[k][i]['label'])
-
-
-
-# st.subheader("Sources")
-
-# cols = st.columns(len(dict_PT))
-# for i, c in enumerate(cols):
-#     with c:
-#         todo_PT[i] = st.checkbox(dict_PT[i]['label'])
-
-
-# todo_PT[0] = st.checkbox('EPTA')
-# todo_PT[1] = st.checkbox('IPTA')
-# todo_PT[1] = st.checkbox('SKA')
-
-
-
-# todo_PT = [0]*3
-# dict_PT = [[]]*3
-# dict_PT[0] = {'N_pulsars':5,  'ObsTime':10,'ObsRate':14,'TimingPrec':1e-7,'color':def_curve_col,'label':'EPTA','label_x':2e-6,'label_y':5e-13}
-# dict_PT[1] = {'N_pulsars':20, 'ObsTime':15,'ObsRate':14,'TimingPrec':1e-7,'color':def_curve_col,'label':'IPTA','label_x':2e-6,'label_y':1e-13}
-# dict_PT[2] = {'N_pulsars':100,'ObsTime':20,'ObsRate':14,'TimingPrec':3e-8,'color':def_curve_col,'label':'SKA' ,'label_x':2e-6,'label_y':7.5e-15}
-
-# todo_SPACE = [0]*6
-# dict_SPACE = [[]]*6
-# dict_SPACE[0] = {'color':def_curve_col,'label':'eLISA'   ,'label_x':1.5e-6,'label_y':7e-17}
-# dict_SPACE[1] = {'color':def_curve_col,'label':'LISA'    ,'label_x':2e-6  ,'label_y':1e-18}
-# dict_SPACE[2] = {'color':def_curve_col,'label':'DECIGO'  ,'label_x':7e-2  ,'label_y':1e-23}
-# dict_SPACE[3] = {'color':def_curve_col,'label':'BBO'     ,'label_x':4.2e-3,'label_y':2e-24}
-# dict_SPACE[4] = {'color':def_curve_col,'label':'ALIA'    ,'label_x':1e-1  ,'label_y':7e-22}
-# dict_SPACE[5] = {'color':def_curve_col,'label':'TianQuin','label_x':2.5e+0,'label_y':1.5e-18}
-
-# todo_GROUND = [0]*10
-# dict_GROUND = [[]]*10
-# dict_GROUND[0] = {'color':def_curve_col,'label':'GEO'           ,'label_x':8e+4  ,'label_y':1.55e-18}
-# dict_GROUND[1] = {'color':def_curve_col,'label':'LIGO'          ,'label_x':8e+4  ,'label_y':7.99e-19}
-# dict_GROUND[2] = {'color':def_curve_col,'label':'aLIGO (O1)'    ,'label_x':4e+4  ,'label_y':1.1e-19}
-# dict_GROUND[3] = {'color':def_curve_col,'label':'aLIGO (des)'   ,'label_x':8e+4  ,'label_y':5.68e-20}
-# dict_GROUND[4] = {'color':def_curve_col,'label':'LIGO A+'       ,'label_x':8e+4  ,'label_y':1.51e-20}
-# dict_GROUND[5] = {'color':def_curve_col,'label':'Virgo'         ,'label_x':8e+4  ,'label_y':4.12e-19}
-# dict_GROUND[6] = {'color':def_curve_col,'label':'Virgo Adv'     ,'label_x':8e+4  ,'label_y':2.13e-19}
-# dict_GROUND[7] = {'color':def_curve_col,'label':'KAGRA'         ,'label_x':8e+4  ,'label_y':2.92e-20}
-# dict_GROUND[8] = {'color':def_curve_col,'label':'ET'            ,'label_x':8e+4  ,'label_y':7.55e-21}
-# dict_GROUND[9] = {'color':def_curve_col,'label':'CE'            ,'label_x':8e+4  ,'label_y':3.9e-21}
+st.divider()
+st.caption("Developed by N. Borghi | Made with [Streamlit](https://streamlit.io/) | Inspired by [gwplotter.com](http://gwplotter.com/)")
