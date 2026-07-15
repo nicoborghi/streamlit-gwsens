@@ -426,12 +426,32 @@ SOURCES = {
     "GW150914": {
         "label": "GW150914",
         "file": "GW150914.csv",
-        "default_selected": True,
+        "default_selected": False,
         "color": "#1d72b7",
         "label_x": 3e+1,
         "label_y": 7e-21,
         "reference": "Abbott et al. (2016), Phys. Rev. Lett. 116, 061102",
         "reference_url": "https://doi.org/10.1103/PhysRevLett.116.061102",
+    },
+    "GW230814": {
+        "label": "GW230814",
+        "file": "GW230814.csv",
+        "default_selected": True,
+        "color": "#d04f2a",
+        "label_x": 2.1e+2,
+        "label_y": 8e-21,
+        "reference": (
+            "LVK (2025), GWTC-4.0 loudest CBC by matched-filter SNR; "
+            "curve scaled from GW150914 using GWOSC chirp mass and distance"
+        ),
+        "reference_url": "https://gwosc.org/eventapi/json/GWTC-4.0/GW230814_230901/v1/",
+        "params": {
+            "common_name": "GW230814_230901",
+            "snr": 43.0,
+            "chirp_mass_source_msun": 26.78,
+            "luminosity_distance_mpc": 290.0,
+            "conversion": "h_c proportional to M_chirp^(5/6) / D_L",
+        },
     },
 }
 
@@ -460,5 +480,3 @@ def get_source_references(keys):
             seen.add(ref)
             refs.append({"name": SOURCES[k]["label"].replace("\n", " "), "reference": ref, "url": SOURCES[k].get("reference_url")})
     return refs
-
-
